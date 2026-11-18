@@ -7,16 +7,18 @@ Tout se lance **depuis la racine du dépôt**, dans l'environnement conda `conve
 conda activate convex_opt
 python -m analysis.q31_plots          # Q3.1 : trajectoire, poussée, écart de relaxation, carburant(t_f)
 python -m analysis.q31_simulate       # Q3.1 : simulation du plan en modes "accel" et "thrust"
+python -m analysis.q31_nonconvex      # Q3.1 : SOCP contre SLSQP sur le problème non convexe (≈ 1 min)
 python -m analysis.q33_benchmark_b1   # Q3.3 : Benchmark B1 (certify=False puis certify=True)
 ```
 
-Bibliothèques utilisées : uniquement celles citées dans `docs/Questions.pdf` (numpy, matplotlib, cvxpy) et le
+Bibliothèques utilisées : uniquement celles citées dans `docs/Questions.pdf` (numpy, scipy, matplotlib, cvxpy) et le
 paquet `lander` fourni. Aucune modification du code fourni (`lander/pointmass.py`, `lander/nonconvex.py`, …).
 
 | Fichier | Question | Produit |
 |---|---|---|
 | `q31_plots.py` | 3.1 (points 1 et 2) | `figures/q31_case_a_solution.{png,pdf}`, `figures/q31_fuel_vs_tf.{png,pdf}` |
 | `q31_simulate.py` | 3.1 (point 3) | `figures/q31_simulate.{png,pdf}`, `results/q31_simulate.md` |
+| `q31_nonconvex.py` | 3.1 (point 4) | `figures/q31_nonconvex.{png,pdf}`, `results/q31_nonconvex.md` |
 | `q33_benchmark_b1.py` | 3.3 | `results/q33_b1_certify_false.md`, `results/q33_b1_certify_true.md` |
 
 Cas A (énoncé) : r0 = (−6, 10) m, v0 = (−2, −1) m/s, réservoir plein (m0 = 5.3 kg), N = 40, γ = 45°, θmax = 30°,
@@ -80,6 +82,36 @@ borne t_min = 0.5 s de Q2.2 est très lâche : elle n'utilise que ‖v0‖ et ig
   au-dessus du sol avec une petite vitesse résiduelle. L'erreur se réduit avec N (intervalles plus courts).
 - Contrepartie : en mode `accel`, la force décroît dans l'intervalle et passe légèrement **sous ρ1** sur l'arc
   à poussée minimale (≈ 0.02 N, figure en bas à droite) ; en mode `thrust`, la force reste dans [ρ1, ρ2].
+
+## Q3.1 — SOCP contre la référence non convexe SLSQP (`q31_nonconvex.py`)
+
+Cas A, **N = 20**, **t_f = 2.909 s** (optimum de `solve_min_fuel` avec N = 20, utilisé par les deux méthodes).
+SLSQP (`lander/nonconvex.py`, fourni) résout (P) sans relaxation, depuis 12 initialisations aléatoires.
+Tableau complet, run par run : `results/q31_nonconvex.md`.
+
+| | SOCP (LCvx, Clarabel) | SLSQP sur (P), 12 départs |
+|---|---|---|
+| succès annoncé par le solveur | 12/12 | 11/12 |
+| solution admissible (contraintes de (P) à 10⁻⁴) | 12/12 | 12/12 |
+| atteint l'optimum du SOCP (±0.1 %) | 12/12 | **0/12** |
+| carburant meilleur / médian / pire (g) | 155.66 / 155.66 / 155.66 | 156.00 / 156.52 / 157.81 |
+| temps par résolution, moyen / max | **0.002 s** / 0.002 s | **4.3 s** / 6.1 s |
+
+![](figures/q31_nonconvex.png)
+
+- **Objectif.** Les 12 runs SLSQP finissent tous au-dessus de l'optimum du SOCP (+0.22 % à +1.38 %), chacun à
+  une valeur différente : ce sont des minima locaux / points stationnaires, qui dépendent de l'initialisation.
+  Le SOCP est convexe : pas d'initialisation, le solveur renvoie l'optimum global, toujours le même ; grâce à la
+  relaxation sans perte (certifiée) il est aussi l'optimum global du problème discret non convexe (P).
+- **Comparaison équitable.** SLSQP mesure le carburant avec son propre modèle discret (force constante sur
+  l'intervalle, masse du début d'intervalle). Le plan SOCP rejoué dans ce modèle consomme 155.79 g (+0.08 %) et
+  arrive à 0.2 mm du pad : cet écart de modèle est bien plus petit que l'écart de SLSQP, la conclusion tient.
+- **Fiabilité.** SLSQP annonce un échec sur 1 run (le n° 5) alors que sa solution est
+  admissible ; et « convergé » ne veut pas dire « optimal ». Le SOCP a un certificat (dualité + écart de
+  relaxation nul) : on sait qu'on est à l'optimum.
+- **Temps.** ≈ 2 000 fois plus rapide (2 ms contre 4 s). SLSQP calcule des gradients par différences finies
+  sur une simulation non linéaire ; le SOCP est compilé une seule fois (DPP), ensuite seule la valeur des
+  paramètres change. C'est ce qui permet de refaire le plan en boucle fermée toutes les 0.5 s (Q4).
 
 ## Q3.3 — Benchmark B1 (`q33_benchmark_b1.py`)
 
