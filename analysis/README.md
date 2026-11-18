@@ -8,6 +8,7 @@ conda activate convex_opt
 python -m analysis.q31_plots          # Q3.1 : trajectoire, poussée, écart de relaxation, carburant(t_f)
 python -m analysis.q31_simulate       # Q3.1 : simulation du plan en modes "accel" et "thrust"
 python -m analysis.q31_nonconvex      # Q3.1 : SOCP contre SLSQP sur le problème non convexe (≈ 1 min)
+python -m analysis.q32_case_b         # Q3.2 : cas B, guidage en deux étapes (erreur min, puis carburant min)
 python -m analysis.q33_benchmark_b1   # Q3.3 : Benchmark B1 (certify=False puis certify=True)
 ```
 
@@ -19,6 +20,7 @@ paquet `lander` fourni. Aucune modification du code fourni (`lander/pointmass.py
 | `q31_plots.py` | 3.1 (points 1 et 2) | `figures/q31_case_a_solution.{png,pdf}`, `figures/q31_fuel_vs_tf.{png,pdf}` |
 | `q31_simulate.py` | 3.1 (point 3) | `figures/q31_simulate.{png,pdf}`, `results/q31_simulate.md` |
 | `q31_nonconvex.py` | 3.1 (point 4) | `figures/q31_nonconvex.{png,pdf}`, `results/q31_nonconvex.md` |
+| `q32_case_b.py` | 3.2 | `figures/q32_case_b_error_vs_tf.{png,pdf}`, `figures/q32_case_b_solution.{png,pdf}`, `results/q32_case_b.md` |
 | `q33_benchmark_b1.py` | 3.3 | `results/q33_b1_certify_false.md`, `results/q33_b1_certify_true.md` |
 
 Cas A (énoncé) : r0 = (−6, 10) m, v0 = (−2, −1) m/s, réservoir plein (m0 = 5.3 kg), N = 40, γ = 45°, θmax = 30°,
@@ -113,21 +115,65 @@ Tableau complet, run par run : `results/q31_nonconvex.md`.
   sur une simulation non linéaire ; le SOCP est compilé une seule fois (DPP), ensuite seule la valeur des
   paramètres change. C'est ce qui permet de refaire le plan en boucle fermée toutes les 0.5 s (Q4).
 
+## Q3.2 — Cas B, guidage en deux étapes (`q32_case_b.py`)
+
+Cas B : r0 = (−6, 9) m, v0 = (−6, 0) m/s, **0.17 kg** de carburant (m0 = 4.67 kg), N = 40.
+Code : `mode="error"` (étape 1, min |x_N|), `mode="fuel_with_error_bound"` (étape 2, min carburant avec
+|x_N| ≤ dmax) et `solve_min_landing_error` dans `lander/lcvx.py` ; la recherche sur t_f est la même fonction que
+pour `solve_min_fuel` (`_tgo_search`, grille puis section dorée, solutions non certifiées = infaisables).
+
+**Pad inatteignable.** `solve_min_fuel` : 0 t_f faisable sur 25 points de [t_min, t_max] = [0.50, 4.25] s.
+
+| | résultat (certify=True) |
+|---|---|
+| erreur d'atterrissage minimale d* | **2.495 m** (posé en x_N = −2.496 m) |
+| temps de vol t_f* | **3.649 s** |
+| carburant consommé (étape 2) | **169.99 g** sur 170 g (il reste 0.007 g) |
+| solution de l'étape 2 certifiée | oui (écart relatif max 3.3·10⁻⁷) |
+
+![](figures/q32_case_b_solution.png)
+![](figures/q32_case_b_error_vs_tf.png)
+
+- **Pourquoi c'est inatteignable.** L'engin part à 6 m/s *en s'éloignant* du pad. Le moteur ne s'éteint jamais
+  (≥ αρ1 = 40 g/s), donc 170 g donnent au plus t_max = 4.25 s de vol. En si peu de temps, il faut à la fois
+  annuler 6 m/s vers la gauche (il recule jusqu'à x ≈ −9.6 m), revenir vers la droite et freiner la descente :
+  il manque ≈ 2.5 m.
+- **Structure de la poussée.** max – min – max (un nœud à ≈ 61 N au départ, long arc à ρ1, freinage
+  final à ρ2) et **tout le carburant est utilisé** : avec la cible hors de
+  portée, chaque gramme sert à se rapprocher. Le glide-slope est ancré au point de contact x_N.
+- **Étape 1, d en fonction de t_f.** Faisable seulement sur une fenêtre étroite (≈ 3.41–3.86 s) : en
+  dehors, plus de solution faisable (trop court : la poussée max ne suffit pas pour se poser en douceur ;
+  trop long : sans doute le carburant, qui ne permet pas de rester en l'air plus longtemps — non vérifié). Les solutions les plus
+  précises pour t_f < 3.65 s **ne sont pas certifiées** (croix orange) : sans certification on trouverait
+  d* = 2.484 m (1 cm de mieux) mais avec un plan non réalisable. Le point certifié isolé vers 3.43 s est un cas
+  limite (une seule solution certifiée dans cette zone) ; il ne change pas l'optimum.
+- **Étape 2** : à t_f*, minimum de carburant avec |x_N| ≤ d* + 1 mm. Ici l'étape 1 utilisait déjà tout le
+  carburant, donc l'étape 2 consomme pareil ; son rôle est de choisir, parmi les trajectoires d'erreur d*,
+  celle qui est économe et certifiée (relaxation exacte).
+- **Simulation du plan** (`results/q32_case_b.md`) : mode `accel` exact (10⁻¹²) ; mode `thrust` 2.6 cm
+  d'écart et **170.08 g** consommés, soit plus que le réservoir : avec zéro marge de carburant, l'effet
+  « force constante, masse qui baisse » de Q3.1 devient critique (le simulateur ponctuel ne coupe pas le moteur
+  quand le réservoir est vide).
+
 ## Q3.3 — Benchmark B1 (`q33_benchmark_b1.py`)
 
 Tableaux complets : `results/q33_b1_certify_false.md` et `results/q33_b1_certify_true.md`.
-**Les cas 17–19 (cible inatteignable) attendent Q3.2** (`solve_min_landing_error`) : dès qu'elle est
-implémentée, relancer le script suffit, il la détecte automatiquement.
+Les cas 17–19 (cible inatteignable) utilisent le guidage en deux étapes de Q3.2 ; un atterrissage compte
+comme réussi à d* + 5 cm près.
 
 | | certify=False | certify=True |
 |---|---|---|
-| atterrissages, cas 0–16 | 17/17 | 17/17 |
-| cas avec écart de relaxation (> 10⁻³ m/s²) | 15/17 | 0/17 |
+| atterrissages, cas 0–16 (atteignables) | 17/17 | 17/17 |
+| atterrissages à d* + 5 cm, cas 17–19 | 3/3 | 3/3 |
+| cas avec écart de relaxation (> 10⁻³ m/s²) | 17/20 | 0/20 |
 | écart de relaxation max | 1.21 m/s² | 7.8·10⁻⁴ m/s² |
-| violation de poussée max (simulation) | **5.84 N** (sous ρ1) | 0.03 N |
-| violation de glide-slope max | 0 | 0 |
-| carburant moyen | 136.4 g (mais solutions irréalisables) | 142.7 g |
-| temps de calcul moyen / max | 0.12 / 0.15 s | 0.11 / 0.13 s |
+| violation de poussée max (simulation) | **5.84 N** (sous ρ1) | 0.035 N |
+| violation de glide-slope max (entre les nœuds) | 2.7 mm | 2.1 mm |
+| carburant moyen (20 cas) | 139.9 g (mais solutions irréalisables) | 145.3 g |
+| temps de calcul moyen / max | 0.15 / 0.24 s | 0.15 / 0.25 s |
+
+Les petites violations de glide-slope (≈ 2 mm, cas 17–19) viennent du fait que le cône n'est imposé qu'aux
+nœuds t_k : entre deux nœuds la trajectoire peut passer légèrement sous le cône (cf. Q2.1).
 
 **Premières observations (pour la personne qui rédige Q3.3).** Avec `certify=False`, la recherche sur t_f
 pousse t_f vers son minimum et l'écart apparaît sur l'arc à poussée minimale. Vérifié sur les cas 5 et 8 :

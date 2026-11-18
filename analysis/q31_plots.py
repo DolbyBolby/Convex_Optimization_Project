@@ -59,8 +59,10 @@ def plot_trajectory(ax, sol, gamma_deg=45.0, n_arrows=10):
     ax.quiver(x[k], y[k], T[k, 0] * scale, T[k, 1] * scale, angles="xy", scale_units="xy", scale=1,
               color=C["orange"], width=0.004, label="thrust direction")
     ax.plot(x[0], y[0], "s", color=C["ink"], ms=4, label="start")
-    ax.plot(xN, y[-1], "*", color=C["red"], ms=9, label="pad")
-    ax.set_xlim(min(x.min(), xN - 1.0) - 1.0, max(x.max(), xN + 1.0) + 1.0)
+    ax.plot(0.0, 0.0, "*", color=C["red"], ms=9, label="pad")
+    if abs(xN) > 1e-3:                                       # touchdown away from the pad (Question 3.2)
+        ax.plot(xN, y[-1], "v", color=C["violet"], ms=6, label=f"touchdown, |x_N| = {abs(xN):.2f} m")
+    ax.set_xlim(min(x.min(), xN - 1.0, -1.0) - 1.0, max(x.max(), xN + 1.0, 1.0) + 1.0)
     ax.set_ylim(-0.3, h)
     ax.set_aspect("equal")
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")

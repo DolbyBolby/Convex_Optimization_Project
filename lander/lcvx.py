@@ -139,11 +139,10 @@ class LanderSOCP:
                 cons += [err <= x_tol]
             obj = fuel
         elif mode == "error":
-            # TODO (Question 3.2): the objective `obj`, the landing error `err`
-            raise NotImplementedError("Question 3.2")
+            obj = err                                # stage 1: minimum landing error |x_N - x_target|
         elif mode == "fuel_with_error_bound":
-            # TODO (Question 3.2): the objective `obj` (the fuel) and the bound `err` <= `self.dmax` (append it to `cons`)
-            raise NotImplementedError("Question 3.2")
+            cons += [err <= self.dmax]               # stage 2: minimum fuel within the landing error dmax
+            obj = fuel
         else:
             raise ValueError(mode)
         # ---------------- extensions used in Question 5 (hazards, trust region, approach cone, map)
@@ -269,31 +268,44 @@ def is_lossless(sol, tol=1e-4):
     return bool(np.max(sol.relaxation_gap / np.maximum(sol.sigma, 1e-9)) <= tol)
 
 
-def solve_min_fuel(prob, x0, m0=None, n_grid=25, tol=0.02, certify=True):
-    """Coarse grid over [t_min, t_max], then golden section around the best feasible grid point.
-    With certify=True, a solution whose relaxation gap is not zero counts as infeasible: we search
-    over CERTIFIED (lossless) solutions only. Returns (best LanderSolution or None, evaluations)."""
+def _tgo_search(prob, x0, m0, n_grid, tol, certify, value):
+    """Time-of-flight search shared by both guidances: coarse grid over tgo_bounds, then golden section around the
+    best grid point, minimizing value(sol). An infeasible tgo, or (certify=True) a tgo whose solution fails
+    is_lossless, counts as np.inf. Returns (best LanderSolution or None, sorted list of (tgo, value))."""
     sols = {}                                    # tgo -> feasible (and, with certify, lossless) solution
 
-    def fuel(tgo):
+    def f(tgo):
         sol = prob.solve(x0, tgo, m0)
         if sol is None or (certify and not is_lossless(sol)):
             return np.inf
         sols[tgo] = sol
-        return sol.fuel
+        return value(sol)
 
     grid = np.linspace(*tgo_bounds(prob.p, x0, m0), n_grid)
-    evals = [(t, fuel(t)) for t in grid]
-    i = int(np.argmin([f for _, f in evals]))
+    evals = [(t, f(t)) for t in grid]
+    i = int(np.argmin([v for _, v in evals]))
     if not np.isfinite(evals[i][1]):             # no feasible time of flight on the grid
         return None, sorted(evals)
-    _, _, ev_gs = golden_section(fuel, grid[max(i - 1, 0)], grid[min(i + 1, n_grid - 1)], tol)
-    best = min(sols.values(), key=lambda s: s.fuel)
+    _, _, ev_gs = golden_section(f, grid[max(i - 1, 0)], grid[min(i + 1, n_grid - 1)], tol)
+    best = min(sols.values(), key=value)
     return best, sorted(evals + ev_gs)
+
+
+def solve_min_fuel(prob, x0, m0=None, n_grid=25, tol=0.02, certify=True):
+    """Coarse grid over [t_min, t_max], then golden section around the best feasible grid point.
+    With certify=True, a solution whose relaxation gap is not zero counts as infeasible: we search
+    over CERTIFIED (lossless) solutions only. Returns (best LanderSolution or None, evaluations)."""
+    return _tgo_search(prob, x0, m0, n_grid, tol, certify, lambda sol: sol.fuel)
 
 
 def solve_min_landing_error(p, x0, m0=None, N=40, g=-10.0, n_grid=25, tol=0.02, certify=True, **kw):
     """Two-stage guidance of Blackmore et al. (2010) for targets that cannot be reached:
     stage 1 finds d* = min over tgo of the landing error; stage 2 minimizes the fuel with error <= d*."""
-    # TODO (Question 3.2): stage 1: LanderSOCP with mode='error' and the same search as solve_min_fuel (landing error instead of fuel); stage 2: LanderSOCP with mode='fuel_with_error_bound', dmax = d_star + 1 mm, solved at the best tgo; return (solution, d_star, sorted list of (tgo, error))
-    raise NotImplementedError("Question 3.2")
+    stage1 = LanderSOCP(p, N, g, mode="error", **kw)
+    best, evals = _tgo_search(stage1, x0, m0, n_grid, tol, certify, lambda sol: sol.landing_error)
+    if best is None:                             # no feasible soft touchdown anywhere
+        return None, None, evals
+    d_star = best.landing_error
+    stage2 = LanderSOCP(p, N, g, mode="fuel_with_error_bound", **kw)
+    stage2.dmax.value = d_star + 1e-3            # 1 mm margin keeps stage 2 feasible
+    return stage2.solve(x0, best.tgo, m0), d_star, evals
