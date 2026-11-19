@@ -16,7 +16,10 @@ import numpy as np
 
 from .model import obs_to_si, main_action, side_action
 from .params import P as PARAMS
-from .lcvx import LanderSOCP, is_lossless
+from .lcvx import LanderSOCP, golden_section, is_lossless
+from typing import cast
+from .lcvx import LanderSolution
+
 
 DEFAULT_ID = dict(F=PARAMS.F, F_side=PARAMS.F_side, k_omega_dry=PARAMS.k_omega_dry)
 
@@ -80,12 +83,48 @@ class CascadeController:
     def _search(self, s, refine=6):
         """Time-to-go search: coarse grid, then golden section around the best grid point (Question 3)."""
         # TODO (Question 4): time-to-go search as in solve_min_fuel (Question 3.1): the fuel of self._solve(s, t) (None = infeasible or not certified) on the grid self.tgo_grid, then `refine` golden-section steps around the best grid point; then solve the best plan again with a time-to-go self.tgo_margin times longer (keep the best plan if this fails); return the plan (dict) or None
+        dico_tp_plan: dict[float, dict] = {}
+        def f(t: float) -> float:
+            plan = self._solve(s, t)
+            if plan is None:
+                return np.inf
+            dico_tp_plan[t] = plan
+
+            sol = cast(LanderSolution, plan["sol"])
+            return sol.fuel
+
+        plan_fuel: list[float] = []
+        for t in self.tgo_grid:
+            plan_fuel.append(f(t))
+
+        if np.min(plan_fuel) == np.inf:
+            return None
+        ind = np.argmin(plan_fuel)
+
+        a = self.tgo_grid[max(ind-1,0)]
+        b = self.tgo_grid[min(ind+1,len(self.tgo_grid)-1)]
+        golden_section(f, a, b, max_iter=refine)
+        best_plan = min(dico_tp_plan.values(), key = lambda p: cast(LanderSolution, p["sol"]).fuel)
+        best_plan_margin = self._solve(s, best_plan["tgo"]*self.tgo_margin)
+        if best_plan_margin is not None:
+            return best_plan_margin
+        return best_plan
 
 
 
     def _replan(self, s):
         # TODO (Question 4): if there is a previous plan and its remaining time tgo = plan['tgo'] - self.k_since / 50 is above 0.6 s, return the first plan found by self._solve(s, f * tgo, certify=False) for f = 1.0, 1.15, 1.3; otherwise (or if all three fail) return a new search self._search(s)
-        raise NotImplementedError("Question 4")
+        if self.plan is None:
+            return self._search(s)
+        tgo = cast(float, self.plan["tgo"]) - self.k_since/50.0
+        if tgo <= 0.6:
+            return self._search(s)
+        for fact in (1.0, 1.15, 1.3):
+            new_plan = self._solve(s, fact*tgo, certify=False)
+            if new_plan is not None:
+                return new_plan
+        return self._search(s)
+
 
     # ------------------------------------------------------------------ main entry
     def act(self, obs, info=None):
