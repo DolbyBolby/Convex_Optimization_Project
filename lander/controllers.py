@@ -80,7 +80,8 @@ class CascadeController:
     def _search(self, s, refine=6):
         """Time-to-go search: coarse grid, then golden section around the best grid point (Question 3)."""
         # TODO (Question 4): time-to-go search as in solve_min_fuel (Question 3.1): the fuel of self._solve(s, t) (None = infeasible or not certified) on the grid self.tgo_grid, then `refine` golden-section steps around the best grid point; then solve the best plan again with a time-to-go self.tgo_margin times longer (keep the best plan if this fails); return the plan (dict) or None
-        raise NotImplementedError("Question 4")
+
+
 
     def _replan(self, s):
         # TODO (Question 4): if there is a previous plan and its remaining time tgo = plan['tgo'] - self.k_since / 50 is above 0.6 s, return the first plan found by self._solve(s, f * tgo, certify=False) for f = 1.0, 1.15, 1.3; otherwise (or if all three fail) return a new search self._search(s)
@@ -142,7 +143,12 @@ class CascadeController:
         i, p_ref, v_ref, a = self._reference(s)
         self.log["track_err"].append(float(np.linalg.norm(p_ref - s[:2])))
         # TODO (Question 4): tracking law a_cmd = u_plan + Kp (r_ref - r) + Kd (v_ref - v), with u_plan = a, the reference (p_ref, v_ref) and the gains self.kp_trk, self.kd_trk
-        raise NotImplementedError("Question 4")
+        s_pos_2_ref = p_ref - s[0:2]
+        s_spd_2_ref = v_ref - s[2:4]
+        u_plan = a
+        kp = self.kp_trk
+        kd = self.kd_trk
+        a_cmd = u_plan + kp * s_pos_2_ref + kd * s_spd_2_ref
         theta_ff = None
         if not self.hover_possible and np.linalg.norm(a) < 0.5 * self.a_min(s[6]):
             nxt = [k for k in range(i, self.N) if np.linalg.norm(self.plan["a"][k]) > 1e-3]
@@ -203,4 +209,3 @@ class CascadeController:
 
 def make_cascade(spec):
     return CascadeController(gravity=spec["gravity"], spec=spec)
-
