@@ -110,27 +110,39 @@ class LanderSOCP:
         # drift caused by a known horizontal wind on each interval (Phase 3); zero unless solve() receives a wind
         drift_v = cp.reshape(self.dvx, (N, 1), order="C") @ e1      # rows (dt w_k, 0)
         drift_r = cp.reshape(self.dpx, (N, 1), order="C") @ e1      # rows (dt^2/2 w_k, 0)
-        # TODO (Question 3.1): the list `cons`: initial state (self.x0, self.zinit); dynamics of Question 2.1 written with `acc`, `drift_v`, `drift_r`; relaxation ||u_k|| <= sigma_k; Taylor bounds (with the variable `dz` = z - z0, which keeps the problem DPP); mass bounds zlo <= z <= zhi and z_N >= ln(m_dry); tilt cone; glide slope y_k - y_N >= tan(gamma) |x_k - x_N| for k = glide_from, ..., N. Then the fuel expression `fuel` = dt * sum(sigma)
-        raise NotImplementedError("Question 3.1")
+        cons = [r[0] == self.x0[:2], v[0] == self.x0[2:], z[0] == self.zinit]              # initial state
+        # exact zero-order-hold dynamics (Question 2.1); dt2 = dt^2 is its own parameter (DPP)
+        cons += [v[1:] == v[:-1] + self.dt * acc + drift_v,
+                 r[1:] == r[:-1] + self.dt * v[:-1] + (self.dt2 / 2) * acc + drift_r,
+                 z[1:] == z[:-1] - self.adt * s]
+        cons += [dz == z[:-1] - self.z0,
+                 cp.norm(u, 2, axis=1) <= s,                                   # relaxation ||u_k|| <= sigma_k
+                 cp.multiply(self.a1, 1 - dz + 0.5 * cp.square(dz)) <= s,      # Taylor bounds (3)
+                 s <= cp.multiply(self.a2, 1 - dz)]
+        cons += [z >= self.zlo, z <= self.zhi, z[N] >= np.log(p.m_dry)]       # mass bounds
+        cons += [u[:, 1] >= np.cos(np.radians(theta_max_deg)) * s]            # tilt cone
+        # glide slope with its apex at the final position, y_k - y_N >= tan(gamma) |x_k - x_N|, k >= glide_from
+        hor = r[glide_from:, 0] - r[N, 0]
+        alt = r[glide_from:, 1] - r[N, 1]
+        self.glide = [alt >= self.tg * hor, alt >= -self.tg * hor]
+        cons += self.glide
+        fuel = self.dt * cp.sum(s)
         err = cp.abs(r[N, 0] - self.xt)              # horizontal landing error |x_N - x_target| (the target is 0)
         if terminal == "ground":
-            # TODO (Question 3.1): touchdown at rest, y_N = 0 and v_N = 0 (append them to `cons`)
-            raise NotImplementedError("Question 3.1")
+            cons += [r[N, 1] == 0.0, v[N] == 0.0]    # touchdown at rest
         else:                                        # approach gate above the pad (provided; used from Question 4 on)
             cons += [r[N, 1] == y_gate, v[N, 0] == 0.0, v[N, 1] == -v_gate]
         if mode == "fuel":
             if terminal == "ground":
-                # TODO (Question 3.1): land at the target, x_N = x_target (`self.xt`, which is 0) (append it to `cons`)
-                raise NotImplementedError("Question 3.1")
+                cons += [r[N, 0] == self.xt]         # land at the target
             else:
                 cons += [err <= x_tol]
             obj = fuel
         elif mode == "error":
-            # TODO (Question 3.2): the objective `obj`, the landing error `err`
-            raise NotImplementedError("Question 3.2")
+            obj = err                                # stage 1: minimum landing error |x_N - x_target|
         elif mode == "fuel_with_error_bound":
-            # TODO (Question 3.2): the objective `obj` (the fuel) and the bound `err` <= `self.dmax` (append it to `cons`)
-            raise NotImplementedError("Question 3.2")
+            cons += [err <= self.dmax]               # stage 2: minimum fuel within the landing error dmax
+            obj = fuel
         else:
             raise ValueError(mode)
         # ---------------- extensions used in Question 5 (hazards, trust region, approach cone, map)
@@ -167,8 +179,15 @@ class LanderSOCP:
         dt = tgo / N
         t = np.arange(N + 1) * dt
         rho1, rho2 = p.rho1, self.thrust_frac * p.rho2
-        # TODO (Question 3.1): set the values of every horizon-dependent parameter: dt, dt2 (= dt^2), adt (= alpha dt), z0, a1, a2, zlo, zhi at the times t_k (use the local rho1, rho2: rho2 includes the factor thrust_frac)
-        raise NotImplementedError("Question 3.1")
+        self.dt.value, self.dt2.value, self.adt.value = dt, dt * dt, p.alpha * dt
+        # mass at full (rho2) and minimum (rho1) thrust since t = 0, clipped at m_dry: the mass never drops below
+        # it, so z >= z0 still holds, and ln stays finite near t_max where m0 - alpha rho2 t < 0
+        m_lo = np.maximum(m0 - p.alpha * rho2 * t, p.m_dry)
+        m_hi = np.maximum(m0 - p.alpha * rho1 * t, p.m_dry)
+        z0 = np.log(m_lo[:-1])                       # Taylor expansion points, one per interval
+        self.z0.value = z0
+        self.a1.value, self.a2.value = rho1 * np.exp(-z0), rho2 * np.exp(-z0)
+        self.zlo.value, self.zhi.value = np.log(m_lo), np.log(m_hi)
         self.zinit.value = np.log(m0)
         return t
 
@@ -249,16 +268,44 @@ def is_lossless(sol, tol=1e-4):
     return bool(np.max(sol.relaxation_gap / np.maximum(sol.sigma, 1e-9)) <= tol)
 
 
+def _tgo_search(prob, x0, m0, n_grid, tol, certify, value):
+    """Time-of-flight search shared by both guidances: coarse grid over tgo_bounds, then golden section around the
+    best grid point, minimizing value(sol). An infeasible tgo, or (certify=True) a tgo whose solution fails
+    is_lossless, counts as np.inf. Returns (best LanderSolution or None, sorted list of (tgo, value))."""
+    sols = {}                                    # tgo -> feasible (and, with certify, lossless) solution
+
+    def f(tgo):
+        sol = prob.solve(x0, tgo, m0)
+        if sol is None or (certify and not is_lossless(sol)):
+            return np.inf
+        sols[tgo] = sol
+        return value(sol)
+
+    grid = np.linspace(*tgo_bounds(prob.p, x0, m0), n_grid)
+    evals = [(t, f(t)) for t in grid]
+    i = int(np.argmin([v for _, v in evals]))
+    if not np.isfinite(evals[i][1]):             # no feasible time of flight on the grid
+        return None, sorted(evals)
+    _, _, ev_gs = golden_section(f, grid[max(i - 1, 0)], grid[min(i + 1, n_grid - 1)], tol)
+    best = min(sols.values(), key=value)
+    return best, sorted(evals + ev_gs)
+
+
 def solve_min_fuel(prob, x0, m0=None, n_grid=25, tol=0.02, certify=True):
     """Coarse grid over [t_min, t_max], then golden section around the best feasible grid point.
     With certify=True, a solution whose relaxation gap is not zero counts as infeasible: we search
     over CERTIFIED (lossless) solutions only. Returns (best LanderSolution or None, evaluations)."""
-    # TODO (Question 3.1): coarse grid of n_grid points on tgo_bounds, then golden_section around the best grid point; with certify=True, a tgo whose solution fails is_lossless counts as infeasible (infinite fuel); return (best solution or None, sorted list of (tgo, fuel))
-    raise NotImplementedError("Question 3.1")
+    return _tgo_search(prob, x0, m0, n_grid, tol, certify, lambda sol: sol.fuel)
 
 
 def solve_min_landing_error(p, x0, m0=None, N=40, g=-10.0, n_grid=25, tol=0.02, certify=True, **kw):
     """Two-stage guidance of Blackmore et al. (2010) for targets that cannot be reached:
     stage 1 finds d* = min over tgo of the landing error; stage 2 minimizes the fuel with error <= d*."""
-    # TODO (Question 3.2): stage 1: LanderSOCP with mode='error' and the same search as solve_min_fuel (landing error instead of fuel); stage 2: LanderSOCP with mode='fuel_with_error_bound', dmax = d_star + 1 mm, solved at the best tgo; return (solution, d_star, sorted list of (tgo, error))
-    raise NotImplementedError("Question 3.2")
+    stage1 = LanderSOCP(p, N, g, mode="error", **kw)
+    best, evals = _tgo_search(stage1, x0, m0, n_grid, tol, certify, lambda sol: sol.landing_error)
+    if best is None:                             # no feasible soft touchdown anywhere
+        return None, None, evals
+    d_star = best.landing_error
+    stage2 = LanderSOCP(p, N, g, mode="fuel_with_error_bound", **kw)
+    stage2.dmax.value = d_star + 1e-3            # 1 mm margin keeps stage 2 feasible
+    return stage2.solve(x0, best.tgo, m0), d_star, evals
