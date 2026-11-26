@@ -1,11 +1,10 @@
 from dataclasses import dataclass
 import math
 
-import cvxpy as cp
 import numpy as np
+import cvxpy as cp
 
-from controllers import CascadeController
-from lander.geometry import closest_point_convex, obstacle_polygons, to_pad
+from lander.geometry import obstacle_polygons, to_pad
 from lander.params import R_Y
 from lander.scenarios import W, H
 
@@ -84,6 +83,14 @@ class Polygon:
         A, b = self.halfplanes()
         return np.all(np.asarray(p) @ A.T <= b + tol, axis=-1)
 
+    def area(self) -> float:
+        n = len(self.points)
+        total = 0.0
+        for i in range(n):
+            (px, py), (qx, qy) = self.points[i], self.points[(i + 1) % n]
+            total += px * qy - qx * py
+        return abs(total) / 2
+
     # nouveau polygone = partie qui vérifie a . p <= b (None si elle est vide)
     def clip(self, a, b: float) -> "Polygon | None":
         pts: list[tuple[float, float]] = []
@@ -108,6 +115,13 @@ class Map:
     bounds: tuple[tuple[float, float], tuple[float, float]]
     obstacles: list[Polygon]
 
+    # polygone qui couvre toute la map, éventuellement restreint à xa <= x <= xb
+    def rectangle(self, xa: float | None = None, xb: float | None = None) -> Polygon:
+        (xmin, ymin), (xmax, ymax) = self.bounds
+        xa = xmin if xa is None else xa
+        xb = xmax if xb is None else xb
+        return Polygon([(xa, ymin), (xb, ymin), (xb, ymax), (xa, ymax)])
+
 
 def load_map(spec, margin_x=1.15, margin_y=R_Y) -> Map:
     obstacles = []
@@ -122,94 +136,265 @@ def load_map(spec, margin_x=1.15, margin_y=R_Y) -> Map:
     return Map(bounds, obstacles)
 
 
-# ellipse {C u + d : ||u|| <= 1} de volume maximal inscrite dans le polygone (problème convexe)
-def max_ellipse(poly: Polygon) -> tuple[np.ndarray, np.ndarray] | None:
-    C = cp.Variable((2, 2), PSD=True)
-    d = cp.Variable(2)
-    A, b = poly.halfplanes()
-    cons = [cp.norm(C @ a) + a @ d <= bi for a, bi in zip(A, b)]
-    cp.Problem(cp.Maximize(cp.log_det(C)), cons).solve(solver=cp.CLARABEL)
-    C_opt, d_opt = C.value, d.value
-    if C_opt is None or d_opt is None:      # le solveur n'a pas trouvé de solution
-        return None
-    return np.asarray(C_opt), np.asarray(d_opt)
+# ---------------------------------------------------------------------- découpage de l'espace libre
+Line = tuple[float, float]                  # droite y = m x + q, notée (m, q)
+HalfPlanes = list[tuple[np.ndarray, float]]  # liste de (a, b) : a . p <= b
 
 
-# coupe les bounds par un demi-plan séparateur par obstacle, le plus proche d'abord (au sens de l'ellipse C, d)
-def separate(carte: Map, C: np.ndarray, d: np.ndarray) -> Polygon | None:
-    (xmin, ymin), (xmax, ymax) = carte.bounds
-    region = Polygon([(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)])
-    Ci = np.linalg.inv(C)
+@dataclass
+class Trapezoid:
+    """Morceau d'espace libre entre deux verticales, un sol et un plafond."""
+    xa: float
+    xb: float
+    floor: Line
+    ceiling: Line
 
-    closest = []
-    for obs in carte.obstacles:
-        P = np.array(obs.points)
-        # dans le repère (p - d) @ Ci, l'ellipse devient le disque unité centré en 0
-        q, dist, n = closest_point_convex((P - d) @ Ci.T, np.zeros(2))
-        closest.append((dist, q, n, P))
-    closest.sort(key=lambda c: c[0])
 
-    planes = []
-    for dist, q, n, P in closest:
-        if any((P @ a >= b - 1e-7).all() for a, b in planes):
-            continue                                # obstacle déjà exclu par un plan précédent
-        if dist <= 1e-9:
-            return None                             # le centre touche l'obstacle
-        a = -Ci.T @ n
-        a /= np.linalg.norm(a)
-        b = a @ (C @ q + d)
-        planes.append((a, b))
+def clip_all(poly: Polygon, planes: HalfPlanes) -> Polygon | None:
+    region: Polygon | None = poly
+    for a, b in planes:
         region = region.clip(a, b)
         if region is None:
-            return None
+            break
     return region
 
 
-# plus grande région convexe libre trouvée autour du point seed (algorithme IRIS)
-def grow_region(carte: Map, seed: np.ndarray, iters: int = 4) -> Polygon | None:
-    C, d = 1e-2 * np.eye(2), seed
-    best = None
-    for _ in range(iters):
-        region = separate(carte, C, d)
-        if region is None or not region.contains(seed):
-            break                                   # la région doit toujours contenir la graine
-        best = region
-        ellipse = max_ellipse(region)
-        if ellipse is None:
-            break
-        C, d = ellipse
-    return best
+def edges(poly: Polygon):
+    n = len(poly.points)
+    return [(poly.points[i], poly.points[(i + 1) % n]) for i in range(n)]
 
 
-# liste de polygones convexes libres (qui se chevauchent) couvrant la map autour des obstacles
-def decompose(carte: Map, seeds=(), max_regions: int = 12, step: float = 0.25) -> list[Polygon]:
-    # grille de points libres : sert à choisir les graines et à suivre la couverture
+# abscisses des sommets des obstacles et des croisements d'arêtes (entre elles et avec le haut / bas de la map)
+def vertical_cuts(carte: Map) -> list[float]:
+    (xmin, ymin), (xmax, ymax) = carte.bounds
+    segments = [(k, e) for k, o in enumerate(carte.obstacles) for e in edges(o)]
+    segments += [(-1, ((xmin, ymin), (xmax, ymin))), (-2, ((xmin, ymax), (xmax, ymax)))]
+    xs = [xmin, xmax] + [x for o in carte.obstacles for x, _ in o.points]
+
+    for i, (k, (a, b)) in enumerate(segments):
+        for other, (c, d) in segments[i + 1:]:
+            if k == other:
+                continue
+            rx, ry = b[0] - a[0], b[1] - a[1]
+            sx, sy = d[0] - c[0], d[1] - c[1]
+            den = rx * sy - ry * sx
+            if abs(den) < 1e-12:                    # segments parallèles
+                continue
+            t = ((c[0] - a[0]) * sy - (c[1] - a[1]) * sx) / den
+            u = ((c[0] - a[0]) * ry - (c[1] - a[1]) * rx) / den
+            if -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9:
+                xs.append(a[0] + t * rx)
+
+    cuts: list[float] = []
+    for x in sorted(x for x in xs if xmin <= x <= xmax):
+        if not cuts or x - cuts[-1] > 1e-6:
+            cuts.append(x)
+    return cuts
+
+
+# pour chaque tranche verticale, les trapèzes libres (décomposition exacte)
+def free_trapezoids(carte: Map) -> list[list[Trapezoid]]:
+    (_, ymin), (_, ymax) = carte.bounds
+    cuts = vertical_cuts(carte)
+    slices = []
+    for xa, xb in zip(cuts[:-1], cuts[1:]):
+        xm = (xa + xb) / 2                          # aucune arête ne se croise à l'intérieur d'une tranche
+
+        # intervalle occupé par chaque obstacle : ((hauteur en xm, droite) en bas, idem en haut)
+        occupied = []
+        for obstacle in carte.obstacles:
+            hits = []
+            for a, b in edges(obstacle):
+                if min(a[0], b[0]) < xm < max(a[0], b[0]):
+                    m = (b[1] - a[1]) / (b[0] - a[0])
+                    q = a[1] - m * a[0]
+                    hits.append((m * xm + q, (m, q)))
+            if hits:
+                occupied.append((min(hits), max(hits)))
+        occupied.sort()
+
+        # les trous entre les intervalles occupés sont libres
+        free: list[Trapezoid] = []
+        top, floor = ymin, (0.0, ymin)
+        for low, high in occupied:
+            if low[0] > top + 1e-9 and top < ymax:
+                ceiling = low[1] if low[0] < ymax else (0.0, ymax)
+                free.append(Trapezoid(xa, xb, floor, ceiling))
+            if high[0] > top:
+                top, floor = high
+        if top < ymax - 1e-9:
+            free.append(Trapezoid(xa, xb, floor, (0.0, ymax)))
+        slices.append(free)
+    return slices
+
+
+# une région convexe libre pour chaque suite de trapèzes voisins
+def candidate_regions(carte: Map) -> list[Polygon]:
+    slices = free_trapezoids(carte)
+    regions = []
+    for first, free in enumerate(slices):
+        for trapezoid in free:
+            stack = [(first, [trapezoid])]
+            while stack:
+                k, chain = stack.pop()
+                # au-dessus de TOUS les sols et sous TOUS les plafonds : convexe et libre
+                planes: HalfPlanes = []
+                for t in chain:
+                    planes.append((np.array([t.floor[0], -1.0]), -t.floor[1]))
+                    planes.append((np.array([-t.ceiling[0], 1.0]), t.ceiling[1]))
+                region = clip_all(carte.rectangle(chain[0].xa, chain[-1].xb), planes)
+
+                # on arrête la suite si la région n'atteint plus sa dernière tranche
+                if region is None or max(x for x, _ in region.points) <= chain[-1].xa + 1e-6:
+                    continue
+                regions.append(region)
+
+                if k + 1 < len(slices):
+                    last, x = chain[-1], chain[-1].xb
+                    for t in slices[k + 1]:         # voisins : ouverture commune sur la verticale x
+                        low = max(m * x + q for m, q in (last.floor, t.floor))
+                        high = min(m * x + q for m, q in (last.ceiling, t.ceiling))
+                        if high - low > 1e-3:
+                            stack.append((k + 1, chain + [t]))
+    return regions
+
+
+# vrai si les deux polygones ont une surface commune
+def overlap(poly: Polygon, other: Polygon, min_area: float = 1e-2) -> bool:
+    common = clip_all(poly, list(zip(*other.halfplanes())))
+    return common is not None and common.area() > min_area
+
+
+# agrandit la région en supprimant les faces inutiles pour rester hors des obstacles
+def widen(region: Polygon, carte: Map) -> Polygon:
+    planes: HalfPlanes = list(zip(*region.halfplanes()))
+    j = 0
+    while j < len(planes):
+        bigger = clip_all(carte.rectangle(), planes[:j] + planes[j + 1:])
+        assert bigger is not None                   # retirer une face ne peut qu'agrandir
+        # marge de 1e-6 : toucher le bord d'un obstacle est permis
+        shrunk = (clip_all(bigger, [(a, b - 1e-6) for a, b in zip(*o.halfplanes())]) for o in carte.obstacles)
+        if any(s is not None and s.area() > 1e-8 for s in shrunk):
+            j += 1                                  # face nécessaire
+        else:
+            del planes[j]
+    result = clip_all(carte.rectangle(), planes)
+    assert result is not None
+    return result
+
+
+# groupes de régions reliées entre elles par des chevauchements
+def components(regions: list[Polygon]) -> list[list[Polygon]]:
+    left = list(regions)
+    groups = []
+    while left:
+        group = [left.pop()]
+        for region in group:                        # la liste grandit pendant le parcours
+            linked = [r for r in left if overlap(region, r)]
+            group += linked
+            left = [r for r in left if r not in linked]
+        groups.append(group)
+    return groups
+
+
+# petite liste de polygones convexes libres (qui se chevauchent) couvrant la map autour des obstacles
+def decompose(carte: Map, seeds=(), max_regions: int = 12, coverage: float = 0.999,
+              step: float = 0.15) -> list[Polygon]:
+    # candidates élargies, sans doublons
+    unique = {}
+    for region in candidate_regions(carte):
+        region = widen(region, carte)
+        key = tuple(sorted((round(x, 3), round(y, 3)) for x, y in region.points))
+        unique[key] = region
+    candidates = list(unique.values())
+
+    # grille de points libres pour mesurer la couverture
     (xmin, ymin), (xmax, ymax) = carte.bounds
     grid = np.array([(x, y) for x in np.arange(xmin + step / 2, xmax, step)
                             for y in np.arange(ymin + step / 2, ymax, step)])
-    obstacles = [np.array(o.points) for o in carte.obstacles]
-    clearance = np.array([min(closest_point_convex(P, p)[1] for P in obstacles) for p in grid])
-    grid, clearance = grid[clearance > 0.05], clearance[clearance > 0.05]
+    grid = grid[~np.any([o.contains(grid, 1e-9) for o in carte.obstacles], axis=0)]
+    covers = np.array([r.contains(grid) for r in candidates])
 
-    regions: list[Polygon] = []
+    chosen: list[Polygon] = []
     covered = np.zeros(len(grid), bool)
-    tried = np.zeros(len(grid), bool)
 
-    def add(seed):
-        region = grow_region(carte, seed)
-        if region is not None:
-            regions.append(region)
-            covered[:] |= region.contains(grid)
+    def choose(i):
+        chosen.append(candidates[i])
+        covered[:] |= covers[i]
 
-    # d'abord les points imposés (départ, porte d'approche)
+    # d'abord les points imposés (départ, porte d'approche) : la plus grande région qui les contient
     for seed in seeds:
         seed = np.asarray(seed, float)
-        if not any(r.contains(seed) for r in regions):
-            add(seed)
+        if not any(r.contains(seed) for r in chosen):
+            inside = [i for i, r in enumerate(candidates) if r.contains(seed)]
+            if inside:
+                choose(max(inside, key=lambda i: candidates[i].area()))
 
-    # puis le point non couvert le plus éloigné des obstacles
-    while len(regions) < max_regions and (~covered & ~tried).any():
-        i = np.argmax(np.where(~covered & ~tried, clearance, -1.0))
-        tried[i] = True
-        add(grid[i])
-    return regions
+    # couverture gloutonne : la région qui ajoute le plus de points non couverts
+    while len(chosen) < max_regions and covered.mean() < coverage:
+        gain = (covers & ~covered).sum(axis=1)
+        best = int(np.argmax(gain))
+        if gain[best] == 0:
+            break
+        choose(best)
+
+    # régions de liaison tant que le graphe n'est pas connexe (peut dépasser max_regions)
+    while len(groups := components(chosen)) > 1:
+        def links(r):
+            return sum(any(overlap(r, other) for other in group) for group in groups)
+        best_link = max(candidates, key=lambda r: (links(r), r.area()))
+        if links(best_link) < 2:
+            break                                   # espace libre réellement non connexe
+        chosen.append(best_link)
+    return chosen
+
+
+# toutes les suites de régions qui vont du départ à la porte
+def simple_paths(regions: list[Polygon], start, gate) -> list[list[int]]:
+    n = len(regions)
+    neighbours = [[j for j in range(n) if j != i and overlap(regions[i], regions[j])] for i in range(n)]
+    starts = [i for i in range(n) if regions[i].contains(start)]
+    paths: list[list[int]] = []
+
+    def explore(path):
+        if regions[path[-1]].contains(gate):
+            paths.append(path)
+            return
+        for j in neighbours[path[-1]]:
+            if j not in path and j not in starts:
+                explore(path + [j])
+
+    for i in starts:
+        explore([i])
+    return paths
+
+
+# ligne brisée la plus courte le long d'un chemin : (longueur, points de passage)
+def shortest_polyline(regions: list[Polygon], path: list[int], start, gate):
+    points = cp.Variable((len(path) + 1, 2))
+    constraints = [points[0] == start, points[-1] == gate]
+    for k in range(1, len(path)):
+        for i in (path[k - 1], path[k]):          # point dans l'intersection des deux régions
+            A, b = regions[i].halfplanes()
+            constraints.append(A @ points[k] <= b)
+    length = cp.sum(cp.norm(points[1:] - points[:-1], axis=1))
+    problem = cp.Problem(cp.Minimize(length), constraints)
+    problem.solve(solver=cp.CLARABEL)
+    solution = points.value
+    if solution is None:
+        return np.inf, None
+    pts = np.asarray(solution)
+    # longueur recalculée à partir des points (problem.value a un type trop vague pour float())
+    return float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()), pts
+
+
+# les meilleurs chemins : liste de (longueur, indices des régions, points de passage)
+# classés par coût = longueur + region_penalty (en mètres) par région traversée
+def find_paths(regions: list[Polygon], start, gate, keep: int = 3, region_penalty: float = 0.25):
+    found = []
+    for path in simple_paths(regions, start, gate):
+        length, points = shortest_polyline(regions, path, start, gate)
+        if points is not None:
+            found.append((length, path, points))
+    found.sort(key=lambda f: f[0] + region_penalty * len(f[1]))
+    return found[:keep]

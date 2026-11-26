@@ -1,9 +1,14 @@
 """Debug view of one episode of the Windy Hazard Landing Challenge (Question 5).
 
-One figure per (policy, scenario, seed):
+Up to three geometry figures per (policy, scenario), without any trajectory:
+  <policy>_<scenario>_obstacles.png  the map with the inflated terrain and hazards;
+  <policy>_<scenario>_regions.png    one panel per convex region of the policy (if it gives any), with the
+                                     approach gate in green (if the policy has `y_gate` and `x_tol`);
+  <policy>_<scenario>_paths.png      the 5 shortest paths from the start to the gate (if the policy gives any),
+                                     with the planned trajectory and its fuel on the 3 shortest.
+And one flight figure per (policy, scenario, seed):
   left   the map in world coordinates: terrain, pad, hazards, hazards inflated by the planning box R_X x R_Y
-         (the set the centre of mass must avoid), optional convex regions of the policy (GCS / corridors),
-         every plan computed during the flight (light = early, dark = late), the flown trajectory coloured by
+         (the set the centre of mass must avoid), every plan computed during the flight (light = early, dark = late), the flown trajectory coloured by
          outcome, the planning box every second and at the moment of minimum hazard clearance;
   right  time series: position vs. active plan, tracking error (with the flight phase), signed clearance of
          the planning box to the hazards and to the terrain (and the minimum clearance of each plan), wind
@@ -16,7 +21,11 @@ What the tool reads from the policy (all optional, only for this offline analysi
          "margin": clearance margin used by the planner (m), ...}       (other keys are ignored)
     or, if absent, the attribute `plan` (a dict with "p" and "dt", as in CascadeController) of the policy or of
     one of its attributes; a new plan is detected when the object changes.
-  * `policy.debug_regions`: list of convex polygons (pad frame) drawn on the map (e.g. the GCS regions).
+  * `policy.debug_regions`: list of convex polygons (pad frame), e.g. the GCS regions.
+  * `policy.debug_obstacles`: list of the inflated polygons used by the planner (pad frame, same order as
+    obstacle_polygons); by default the obstacles inflated by R_X x R_Y.
+  * `policy.debug_paths`: list of (length, region indices, (L+1, 2) waypoints in the pad frame).
+  * `policy.debug_path_plans`: dict {tuple(region indices): plan with .p (N+1, 2), .fuel (kg), .tgo (s), or None}.
   * `phase` (str), on the policy or on the same nested controller (e.g. "POWERED", "TERMINAL").
 The wind estimate is recomputed here with a separate GustEstimator, so it works for any policy.
 
@@ -141,11 +150,14 @@ def run(source, sid, seed):
         if term or trunc:
             break
     env.close()
+    planner = next((o for o in (policy, rec.inner) if hasattr(o, "y_gate") and hasattr(o, "x_tol")), None)
+    gate = None if planner is None else (planner.x_tol, planner.y_gate)
     outcome = info["outcome"] or "timeout"
     return dict(sid=sid, seed=seed, spec=spec, sc=sc, outcome=outcome, score=score_episode(outcome, env.fuel),
                 fuel=env.fuel, t=np.array(T), s=np.array(S), a=np.array(A), wind=np.array(Wd), xi=np.array(XI),
-                phase=PH, plans=rec.plans, regions=getattr(policy, "debug_regions", None),
-                policy_ms=1000 * t_pol / len(T))
+                phase=PH, plans=rec.plans, regions=getattr(policy, "debug_regions", None), obstacles=getattr(policy, "debug_obstacles", None),
+                policy_ms=1000 * t_pol / len(T), gate=gate, paths=getattr(policy, "debug_paths", None),
+                path_plans=getattr(policy, "debug_path_plans", None))
 
 
 # ---------------------------------------------------------------------- reference of the active plan
@@ -202,9 +214,6 @@ def plot(ep, name="policy"):
     # ---- map
     ax = fig.add_subplot(gs[:, 0])
     draw_map(ax, sc, label=False)
-    if ep["regions"]:
-        for R in ep["regions"]:
-            ax.add_patch(Polygon(np.asarray(R) + off, closed=True, fc=C["blue"], ec=C["blue"], alpha=0.08, lw=0.8))
     for Q in hz:
         ax.add_patch(Polygon(Q + off, closed=True, fill=False, ec=C["red"], ls="--", lw=0.9))
     cmap = plt.get_cmap("Blues")
@@ -302,6 +311,111 @@ def plot(ep, name="policy"):
     return fig
 
 
+# ---------------------------------------------------------------------- geometry figures (no trajectory)
+def _draw_inflated(ax, ep):
+    """Map with the inflated obstacles behind it. Each kind is filled with one opaque colour, so that the
+    overlapping pieces appear as their union."""
+    from matplotlib.patches import Polygon
+    from lander.plot import draw_map
+
+    sc, spec = ep["sc"], ep["spec"]
+    off = np.array([sc.pad_center, sc.pad[2] + LEG_DOWN])          # pad frame -> world
+    polys = ep["obstacles"]
+    if polys is None:                              # the policy gives none: planning box R_X x R_Y
+        polys = [inflate(P) for P in obstacle_polygons(spec)[0]]
+    n_terrain = len(polys) - len(spec["hazards"])  # same order as obstacle_polygons: terrain, then hazards
+    draw_map(ax, sc, label=False)
+    for i, Q in enumerate(polys):
+        ax.add_patch(Polygon(np.asarray(Q) + off, closed=True, lw=0, zorder=0.8,
+                             fc="#c4c2b9" if i < n_terrain else "#f8cfc9"))
+    return off
+
+
+def plot_obstacles(ep, name="policy"):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from lander.style import apply
+    apply()
+
+    fig, ax = plt.subplots(figsize=(11, 8), layout="constrained")
+    _draw_inflated(ax, ep)
+    ax.legend(handles=[Patch(fc="#c4c2b9", label="terrain gonflé"), Patch(fc="#f8cfc9", label="dangers gonflés")],
+              loc="upper left", fontsize=8)
+    ax.set_xlabel("x monde (m)"); ax.set_ylabel("y monde (m)")
+    fig.suptitle(f"{name} — {ep['sc'].sid} {ep['sc'].name} — obstacles gonflés", fontsize=11)
+    return fig
+
+
+def plot_regions(ep, name="policy"):
+    """One panel per convex region of the policy, with the approach gate of the planner in green."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon, Rectangle
+    from lander.style import C, apply
+    apply()
+
+    regions = ep["regions"]
+    ncols = min(3, len(regions))
+    nrows = int(np.ceil(len(regions) / ncols))
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.9 * nrows), squeeze=False, layout="constrained")
+    for i, (ax, R) in enumerate(zip(axs.flat, regions)):
+        off = _draw_inflated(ax, ep)
+        ax.add_patch(Polygon(np.asarray(R) + off, closed=True, fc=C["blue"], ec="none", alpha=0.3, zorder=2))
+        ax.add_patch(Polygon(np.asarray(R) + off, closed=True, fill=False, ec=C["blue"], lw=1.4, zorder=3))
+        if ep["gate"] is not None:                 # the gate is the segment |x| <= x_tol at y = y_gate
+            x_tol, y_gate = ep["gate"]
+            h = 0.2                                # drawn with a thickness to be visible
+            ax.add_patch(Rectangle(off + [-x_tol, y_gate - h / 2], 2 * x_tol, h, fc=C["green"], ec=C["green"],
+                                   zorder=4))
+        ax.set_title(f"région {i}", fontsize=9)
+    for ax in axs.flat[len(regions):]:
+        ax.axis("off")
+    fig.suptitle(f"{name} — {ep['sc'].sid} {ep['sc'].name} — {len(regions)} régions convexes", fontsize=11)
+    return fig
+
+
+def plot_paths(ep, name="policy", n_max=5):
+    """The shortest paths of the policy, one panel each, from the shortest to the longest. The 3 shortest also
+    show the trajectory optimised before the flight (if the policy gives it); the most economical is marked."""
+    import matplotlib.pyplot as plt
+    from lander.style import C, apply
+    apply()
+
+    paths = sorted(ep["paths"], key=lambda p: p[0])[:n_max]
+    plans = ep["path_plans"] or {}
+    fuels = {i: plans[tuple(p[1])].fuel for i, p in enumerate(paths) if plans.get(tuple(p[1])) is not None}
+    cheapest = min(fuels, key=fuels.get) if fuels else None
+    ncols = min(3, len(paths))
+    nrows = int(np.ceil(len(paths) / ncols))
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.9 * nrows), squeeze=False, layout="constrained")
+    for i, (ax, (length, indices, points)) in enumerate(zip(axs.flat, paths)):
+        off = _draw_inflated(ax, ep)
+        xy = np.asarray(points) + off
+        ax.plot(xy[:, 0], xy[:, 1], "-o", color=C["blue"], lw=1.8, ms=3.5, zorder=3, label="ligne brisée")
+        ax.plot(*xy[0], "o", color=C["blue"], ms=8, zorder=4)             # start
+        ax.plot(*xy[-1], "s", color=C["green"], ms=7, zorder=4)           # gate
+        regions = " → ".join(str(k) for k in indices)
+        title = f"chemin {i + 1} : {length:.2f} m (régions {regions})"
+        if tuple(indices) in plans:
+            plan = plans[tuple(indices)]
+            if plan is None:
+                title += "\naucune trajectoire certifiée trouvée"
+            else:
+                xy = plan.p + off
+                ax.plot(xy[:, 0], xy[:, 1], "-o", color=C["orange"], lw=1.8, ms=2.5, zorder=3.5,
+                        label="trajectoire planifiée")
+                title += f"\ncarburant prévu {1000 * plan.fuel:.1f} g, durée {plan.tgo:.2f} s"
+                if i == cheapest:
+                    title += "  ★ le plus économe"
+        if i == 0 and plans:
+            ax.legend(loc="lower left", fontsize=7)
+        ax.set_title(title, fontsize=9, fontweight="bold" if i == cheapest else "normal")
+    for ax in axs.flat[len(paths):]:
+        ax.axis("off")
+    fig.suptitle(f"{name} — {ep['sc'].sid} {ep['sc'].name} — {len(paths)} chemin(s), du plus court au plus long",
+                 fontsize=11)
+    return fig
+
+
 def _legend(ax, ncol=2):
     ax.legend(loc="upper right", ncol=ncol, fontsize=7, frameon=True, framealpha=0.85, edgecolor="none")
 
@@ -348,8 +462,26 @@ def main():
     name = os.path.splitext(os.path.basename(a.policy.split(":")[-1]))[0]
     os.makedirs(a.out_dir, exist_ok=True)
     for sid in sids:
-        for seed in _seeds(a.seeds):
+        for j, seed in enumerate(_seeds(a.seeds)):
             ep = run(a.policy, sid, seed)
+            if j == 0:                             # geometry figures: once per scenario (they ignore the seed)
+                figs = dict(obstacles=plot_obstacles(ep, name))
+                if ep["regions"]:
+                    figs["regions"] = plot_regions(ep, name)
+                if ep["paths"]:
+                    figs["paths"] = plot_paths(ep, name)
+                    ranked = sorted(ep["paths"], key=lambda p: p[0])
+                    found = [(plan.fuel, i + 1, p[1]) for i, p in enumerate(ranked)
+                             if (plan := (ep["path_plans"] or {}).get(tuple(p[1]))) is not None]
+                    if found:
+                        fuel, i, indices = min(found)
+                        print(f"{sid} le plus économe : chemin {i} (régions {indices}), {1000 * fuel:.1f} g prévus")
+                for kind, fig in figs.items():
+                    if not a.show:
+                        path = os.path.join(a.out_dir, f"{name}_{sid}_{kind}.png")
+                        fig.savefig(path)
+                        plt.close(fig)
+                        print(f"{sid} {kind}  ->  {path}")
             line = f"{sid} seed {seed:3d}: {ep['outcome']:8s} score {ep['score']:6.1f}  plans {len(ep['plans']):3d}"
             if a.failures_only and ep["outcome"] == "success":
                 print(line); continue

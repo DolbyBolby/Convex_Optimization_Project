@@ -187,10 +187,16 @@ certifiée (par ex. avec la poussée bornée à ρ1).
 
 ## Q5 — Outil de debug d'un épisode (`q5_debug.py`)
 
-Une figure par (politique, scénario, seed) : carte avec les dangers gonflés par la boîte R_X × R_Y, tous les
-plans recalculés (clair = tôt, foncé = tard), le vol réel coloré selon l'issue et la boîte au moment de la
-clearance minimale ; à droite, position contre plan actif, erreur de suivi (+ phase), clearance signée aux
-dangers et au terrain (+ min de chaque plan), vent vrai / connu / estimé, θ et commandes moteur.
+Quatre types de figures, pour que rien ne se superpose :
+
+- `<politique>_<scénario>_obstacles.png` : la carte avec le terrain et les dangers gonflés (sans trajectoire) ;
+- `<politique>_<scénario>_regions.png` : un panneau par région convexe (sans trajectoire), porte d'approche en vert ;
+- `<politique>_<scénario>_paths.png` : les 5 chemins les plus courts, un par panneau, avec sur les 3 premiers
+  la trajectoire optimisée avant le vol et son carburant (le plus économe est marqué) ;
+- `<politique>_<scénario>_seed<seed>.png` : le vol, avec les dangers gonflés par la boîte R_X × R_Y, tous les plans
+  recalculés (clair = tôt, foncé = tard), la trajectoire colorée selon l'issue et la boîte au moment de la clearance
+  minimale ; à droite, position contre plan actif, erreur de suivi (+ phase), clearance signée aux dangers et au
+  terrain (+ min de chaque plan), vent vrai / connu / estimé, θ et commandes moteur.
 
 ```bash
 python -m analysis.q5_debug --policy lander.controllers:make_cascade --scenarios S04 --seeds 3
@@ -201,4 +207,8 @@ python -m analysis.q5_debug --policy ... --scenarios S05 --seeds 1 --show      #
 Figures dans `analysis/figures/debug/` (ignoré par git). Sans rien changer, l'outil lit l'attribut `plan` du
 contrôleur (comme `CascadeController`). Pour le contrôleur Q5, on peut exposer en plus :
 - `self.debug_plans` : liste de dicts `{"t", "p" (N+1, 2), "dt", "margin" (optionnel)}`, un par plan ;
-- `self.debug_regions` : liste de polygones convexes (repère pad), par ex. les régions du GCS.
+- `self.debug_regions` : liste de polygones convexes (repère pad), par ex. les régions du GCS ;
+- `self.debug_obstacles` : les polygones gonflés utilisés par le planificateur (repère pad, même ordre que
+  `obstacle_polygons`) ; par défaut, les obstacles gonflés par R_X × R_Y ;
+- `self.debug_paths` : liste de `(longueur, indices des régions, points de passage)` (repère pad) ;
+- `self.debug_path_plans` : dict `{tuple(indices): plan (.p, .fuel, .tgo) ou None}`.
