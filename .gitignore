@@ -222,3 +222,6 @@ __marimo__/
 #Mac OS files 
 
 .DS_Store
+
+# Debug figures of Q5 (analysis/q5_debug.py), regenerated on demand
+analysis/figures/debug/

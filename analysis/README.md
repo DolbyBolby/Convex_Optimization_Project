@@ -184,3 +184,21 @@ Phase 1 (λ_v vertical → ‖T‖ < Γ). Le simulateur vole alors une poussée 
 2.98 → 3.50 s ; cas 8 : 2.38 → 2.67 s) et un peu plus de carburant (cas 5 : 142 → 159 g), mais le plan est
 réalisable. Reste à faire pour Q3.3 : montrer en simulation ce qui se passe quand on vole une solution non
 certifiée (par ex. avec la poussée bornée à ρ1).
+
+## Q5 — Outil de debug d'un épisode (`q5_debug.py`)
+
+Une figure par (politique, scénario, seed) : carte avec les dangers gonflés par la boîte R_X × R_Y, tous les
+plans recalculés (clair = tôt, foncé = tard), le vol réel coloré selon l'issue et la boîte au moment de la
+clearance minimale ; à droite, position contre plan actif, erreur de suivi (+ phase), clearance signée aux
+dangers et au terrain (+ min de chaque plan), vent vrai / connu / estimé, θ et commandes moteur.
+
+```bash
+python -m analysis.q5_debug --policy lander.controllers:make_cascade --scenarios S04 --seeds 3
+python -m analysis.q5_debug --policy submissions/Q5/gcs.py --scenarios all --seeds 0-9 --failures-only
+python -m analysis.q5_debug --policy ... --scenarios S05 --seeds 1 --show      # fenêtre interactive
+```
+
+Figures dans `analysis/figures/debug/` (ignoré par git). Sans rien changer, l'outil lit l'attribut `plan` du
+contrôleur (comme `CascadeController`). Pour le contrôleur Q5, on peut exposer en plus :
+- `self.debug_plans` : liste de dicts `{"t", "p" (N+1, 2), "dt", "margin" (optionnel)}`, un par plan ;
+- `self.debug_regions` : liste de polygones convexes (repère pad), par ex. les régions du GCS.
