@@ -33,7 +33,7 @@ class GCSPolicy(CascadeController):
         self.route = None           # (indices des régions, nœuds de changement) du plan courant
 
     # ------------------------------------------------------------------ planification en vol
-    def _search(self, s):
+    def _search(self, s, refine=6):
         """Nouveau plan depuis l'état mesuré : le plus économe parmi les 2 meilleurs chemins."""
         # si la position mesurée n'est dans aucune région, on reprend les chemins du départ moyen
         paths = find_paths(self.regions, s[:2], self.gate, keep=2) or self.paths[:2]
@@ -73,6 +73,13 @@ class GCSPolicy(CascadeController):
                         break
         return self._search(s)
 
+    def _terminal(self, s):
+            v_ref = np.array([np.clip(-0.3 * s[0], -0.3, 0.3), -self.v_gate])
+            a_cmd = np.array([0.0, -self.g]) + np.array([2.0, 3.0]) * (v_ref - s[2:4])
+            a_cmd[0] -= known_wind(self.spec["wind"], s[1])    # seul ajout : annule le vent connu
+            engine = self.a_min(s[6]) < -self.g or s[3] < -self.v_gate
+            return self._to_action(s, a_cmd, engine=engine)
+
     def _adopt(self, path, switches, sol):
         self.route = (path, switches)
         return dict(kind="gcs", tgo=sol.tgo, dt=sol.tgo / self.N, p=sol.p, v=sol.v, a=sol.u, m=np.exp(sol.z),
@@ -81,9 +88,11 @@ class GCSPolicy(CascadeController):
     def _reference(self, s):
         """Référence de la cascade, plus le vent connu que le plan prend en compte."""
         i, p_ref, v_ref, a = super()._reference(s)
-        dt = self.plan["dt"]
+        plan = self.plan
+        assert plan is not None             # _reference n'est appelée que s'il y a un plan (voir _step)
+        dt = plan["dt"]
         tau = min(self.k_since / 50 - i * dt, dt)
-        wind = np.array([known_wind(self.spec["wind"], self.plan["p"][i, 1]), 0.0])
+        wind = np.array([known_wind(self.spec["wind"], plan["p"][i, 1]), 0.0])
         return i, p_ref + 0.5 * tau * tau * wind, v_ref + tau * wind, a
 
 
