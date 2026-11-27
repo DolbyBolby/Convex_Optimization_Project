@@ -12,10 +12,17 @@ class GCSPolicy(WindRobustController):
     Hérité de WindRobustController : estimation de la rafale, feedforward dans _track, _terminal et _fallback,
     référence avec vent. Les drapeaux use_drift, use_ff et use_risk activent ou désactivent une composante.
     Le coût de risque est désactivé par défaut : avec ces régions, il a fait baisser le score moyen (20 graines
-    d'entraînement : 66.4 sans, 64.5 avec w_haz = 5, 60.5 avec w_haz = 150)."""
+    d'entraînement : 66.4 sans, 64.5 avec w_haz = 5, 60.5 avec w_haz = 150).
 
-    def __init__(self, spec, use_risk=False, w_haz=20.0, **kw):
-        super().__init__(spec, use_risk=use_risk, w_haz=w_haz, **kw)
+    Réglages liés à la rotation du corps, que la SOCP ignore :
+      tgo_margin       marge sur le temps de vol, pour des plans moins brusques ;
+      narrow_tilt_deg  inclinaison maximale planifiée dans les régions de largeur < narrow_width (m) ;
+      terminal_vx      |v_x| maximal (m/s) pour passer en descente terminale avant la porte."""
+
+    def __init__(self, spec, use_risk=False, w_haz=20.0, tgo_margin=1.35, narrow_width=2.0, narrow_tilt_deg=10.0,
+                 terminal_vx=1.0, **kw):
+        self.narrow_width, self.narrow_tilt_deg, self.terminal_vx = narrow_width, narrow_tilt_deg, terminal_vx
+        super().__init__(spec, use_risk=use_risk, w_haz=w_haz, tgo_margin=tgo_margin, **kw)
         start = to_pad(spec, spec["start"][:2])
         gate = self.gate = np.array([0.0, self.y_gate])
         carte = load_map(spec)
@@ -36,6 +43,19 @@ class GCSPolicy(WindRobustController):
     def reset(self):
         super().reset()
         self.route = None           # (indices des régions, nœuds de changement) du plan courant
+
+    # ------------------------------------------------------------------ pilotage
+    def _go_terminal(self, s):
+        """Sous la porte, ou fin de plan à basse altitude, mais seulement si la vitesse horizontale est faible."""
+        if s[1] < self.y_gate + 0.1:
+            return True
+        return super()._go_terminal(s) and abs(s[2]) < self.terminal_vx
+
+    def _throttle(self, s, a_cmd):
+        axis = np.array([-np.sin(s[4]), np.cos(s[4])])
+        if not self.hover_possible and a_cmd @ axis <= 0:       # basse gravité
+            return 0.0              # le moteur ne pousse que vers le haut du corps : l'allumer éloignerait de la cible
+        return super()._throttle(s, a_cmd)
 
     # ------------------------------------------------------------------ planification en vol
     def _search(self, s, refine=6):

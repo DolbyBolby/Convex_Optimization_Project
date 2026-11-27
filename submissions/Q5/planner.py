@@ -6,16 +6,23 @@ cherche autour d'elle les nœuds de changement de région et le temps de vol.
 Vent (wind_robust.py) : le vent connu et la décroissance de la rafale estimée xi0 sont dans la dynamique. Avec
 ctrl.use_risk, on ajoute le coût de risque : les contraintes dures restent les faces des régions, le risque porte sur
 les vrais obstacles, linéarisés autour d'une trajectoire de référence.
+
+Couloirs étroits : la SOCP ignore la rotation du corps et un lander incliné est plus large. Dans les régions étroites,
+on borne donc l'inclinaison de la poussée ; la limite est levée dans le repli à contraintes souples (max_slack infini).
 """
 from dataclasses import dataclass
 import itertools
 
+import cvxpy as cp
 import numpy as np
 
 from lander.wind import known_wind
 from lcvx import LanderSOCP, LanderSolution
 from gcs import Polygon
 from wind_robust import RobustLanderSOCP, expected_gust_drift
+
+
+NO_LIMIT = 1e3
 
 
 @dataclass
@@ -47,6 +54,14 @@ class PathPlanner:
         self.socp = (RobustLanderSOCP(ctrl.p, self.N, ctrl.g, n_walls=self.faces, n_risk=self.hazards.n_walls,
                                       w_haz=ctrl.G.w_haz, **options) if self.use_risk
                      else LanderSOCP(ctrl.p, self.N, ctrl.g, n_obs=self.faces, **options))
+        # inclinaison maximale |u_x| <= tan_max u_y par intervalle, active dans les régions étroites
+        self.narrow = [np.ptp([x for x, _ in r.points]) < ctrl.narrow_width for r in regions]
+        self.narrow_tan = np.tan(np.radians(ctrl.narrow_tilt_deg))
+        self.tan_max = cp.Parameter(self.N, nonneg=True)
+        u = self.socp.u
+        self.socp.prob = cp.Problem(self.socp.prob.objective,
+                                    self.socp.prob.constraints + [cp.abs(u[:, 0]) <= cp.multiply(self.tan_max, u[:, 1])])
+        assert self.socp.prob.is_dcp(dpp=True), "problem must be DPP"
 
     def solve(self, path: list[int], switches: list[int], tgo: float, x0, m0: float, certify: bool = True,
               max_slack: float = 1e-6, ref: np.ndarray | None = None) -> LanderSolution | None:
@@ -55,8 +70,11 @@ class PathPlanner:
         # région de l'intervalle k ; LanderSOCP l'impose aux nœuds k et k+1 sous la forme H r >= b
         H = np.zeros((self.faces, self.N + 1, 2))
         b = -np.ones((self.faces, self.N + 1))                    # lignes inutilisées : 0 >= -1
+        index = [path[sum(k >= s for s in switches)] for k in range(self.N + 1)]
+        strict = np.isfinite(max_slack)
+        self.tan_max.value = np.array([self.narrow_tan if strict and self.narrow[i] else NO_LIMIT for i in index[:-1]])
         for k in range(self.N + 1):
-            A, bb = self.regions[path[sum(k >= s for s in switches)]].halfplanes()
+            A, bb = self.regions[index[k]].halfplanes()
             H[:len(bb), k] = -A
             b[:len(bb), k] = -bb
         if isinstance(self.socp, RobustLanderSOCP):
