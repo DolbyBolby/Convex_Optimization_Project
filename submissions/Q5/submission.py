@@ -1,16 +1,19 @@
-from controllers import CascadeController
 from lander.geometry import to_pad
-from lander.wind import known_wind
 import numpy as np
 
 from gcs import decompose, find_paths, load_map
 from planner import PathPlanner
+from wind_robust import WindRobustController
 
 
-class GCSPolicy(CascadeController):
-    def __init__(self, spec):
-        super().__init__(gravity=spec["gravity"], spec=spec)
-        self.spec = spec
+class GCSPolicy(WindRobustController):
+    """Guidage GCS (régions convexes + chemins) avec la gestion du vent de wind_robust.py.
+
+    Hérité de WindRobustController : estimation de la rafale, feedforward dans _track, _terminal et _fallback,
+    référence avec vent. Les drapeaux use_drift, use_ff et use_risk désactivent une composante."""
+
+    def __init__(self, spec, **kw):
+        super().__init__(spec, **kw)
         start = to_pad(spec, spec["start"][:2])
         gate = self.gate = np.array([0.0, self.y_gate])
         carte = load_map(spec)
@@ -41,13 +44,14 @@ class GCSPolicy(CascadeController):
                  if (plan := self.planner.optimize(path, points, s[:4], s[6])) is not None]
         if not found:
             return None
-        plan, path = min(found, key=lambda f: f[0].fuel)
-        # marge de temps pour les rotations (comme dans la cascade)
-        sol = self.planner.solve(path, plan.switches, self.tgo_margin * plan.tgo, s[:4], s[6])
+        plan, path = min(found, key=lambda f: f[0].cost)
+        # marge de temps pour les rotations (comme dans la cascade) ; obstacles relinéarisés autour du plan trouvé
+        sol = self.planner.solve(path, plan.switches, self.tgo_margin * plan.tgo, s[:4], s[6], ref=plan.p)
         return self._adopt(path, plan.switches, plan.solution if sol is None else sol)
 
     def _replan(self, s):
         """Horizon décroissant le long du même chemin ; nouvelle recherche seulement en dernier recours."""
+        self.planner.xi0 = self.xi_hat if self.use_drift else 0.0    # rafale prise en compte par ce plan
         if self.plan is None or self.route is None:
             return self._search(s)
         elapsed = self.k_since / 50
@@ -65,35 +69,19 @@ class GCSPolicy(CascadeController):
             for factor in factors:
                 for offset in offsets:
                     sw = [int(np.clip(round(t / remaining * self.N) + offset, 1, self.N - 1)) for t in times]
+                    ref = self._reference_path(s, factor * remaining, (self.plan, elapsed))
                     sol = self.planner.solve(path, sw, factor * remaining, s[:4], s[6], certify=False,
-                                             max_slack=max_slack)
+                                             max_slack=max_slack, ref=ref)
                     if sol is not None:
                         return self._adopt(path, sw, sol)
                     if not sw:                                       # une seule région : pas de décalage
                         break
         return self._search(s)
 
-    def _terminal(self, s):
-            v_ref = np.array([np.clip(-0.3 * s[0], -0.3, 0.3), -self.v_gate])
-            a_cmd = np.array([0.0, -self.g]) + np.array([2.0, 3.0]) * (v_ref - s[2:4])
-            a_cmd[0] -= known_wind(self.spec["wind"], s[1])    # seul ajout : annule le vent connu
-            engine = self.a_min(s[6]) < -self.g or s[3] < -self.v_gate
-            return self._to_action(s, a_cmd, engine=engine)
-
     def _adopt(self, path, switches, sol):
         self.route = (path, switches)
         return dict(kind="gcs", tgo=sol.tgo, dt=sol.tgo / self.N, p=sol.p, v=sol.v, a=sol.u, m=np.exp(sol.z),
-                    sol=sol)
-
-    def _reference(self, s):
-        """Référence de la cascade, plus le vent connu que le plan prend en compte."""
-        i, p_ref, v_ref, a = super()._reference(s)
-        plan = self.plan
-        assert plan is not None             # _reference n'est appelée que s'il y a un plan (voir _step)
-        dt = plan["dt"]
-        tau = min(self.k_since / 50 - i * dt, dt)
-        wind = np.array([known_wind(self.spec["wind"], plan["p"][i, 1]), 0.0])
-        return i, p_ref + 0.5 * tau * tau * wind, v_ref + tau * wind, a
+                    sol=sol, xi0=self.planner.xi0, wind=True)     # clés lues par _reference et le feedforward
 
 
 def make_policy(spec):

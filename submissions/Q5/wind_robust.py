@@ -545,18 +545,21 @@ class RobustLanderSOCP(LanderSOCP):
         de W_em, le « poids d'urgence ».
     On AJOUTE : les variables de risque q_{i,k}, leurs contraintes (31)-(32) et le terme W_haz sum q dans l'objectif."""
 
-    def __init__(self, p=PARAMS, N=20, g=-10.0, n_walls=4, w_haz=150.0, w_em=None, **kw):
+    def __init__(self, p=PARAMS, N=20, g=-10.0, n_walls=4, w_haz=150.0, w_em=None, n_risk=None, **kw):
         w_em = 20.0 * w_haz if w_em is None else w_em             # W_em >= 20 W_haz (Section 7.5)
         # Construit tout le SOCP de base avec n_walls emplacements de murs ; **kw transmet les autres réglages
         # (mode, terminal, theta_max_deg, glide_from, thrust_frac, y_gate, v_gate, x_tol, map_limits, shear).
         super().__init__(p, N, g, n_obs=n_walls, w_slack=w_em, **kw)
         self.n_walls, self.w_haz, self.w_em = n_walls, w_haz, w_em
+        # Les murs du risque peuvent différer des murs physiques (GCS : faces des régions pour la contrainte, vrais
+        # obstacles pour le risque). Par défaut, ce sont les mêmes.
+        self.n_risk = n_walls if n_risk is None else n_risk
         # Paramètres du risque. On veut z = (n^T r - b) / sigma. Écrire (1/sigma) * (n^T r) multiplierait deux
         # paramètres (1/sigma et n) par une variable (r), ce qui est interdit par les règles DPP (le problème devrait
         # être recompilé à chaque résolution). On donne donc directement Hs = n / sigma et bs = b / sigma : un seul
         # paramètre multiplie la variable, c'est DPP.
-        self.Hs = [cp.Parameter((N + 1, 2), name=f"Hs{j}") for j in range(n_walls)]
-        self.bs = [cp.Parameter(N + 1, name=f"bs{j}") for j in range(n_walls)]
+        self.Hs = [cp.Parameter((N + 1, 2), name=f"Hs{j}") for j in range(self.n_risk)]
+        self.bs = [cp.Parameter(N + 1, name=f"bs{j}") for j in range(self.n_risk)]
         cons, risk = [], []
         for Hs, bs in zip(self.Hs, self.bs):                                       # un emplacement de mur à la fois
             q = cp.Variable(N, nonneg=True, name="q")   # q_{i,k} >= 0, nœuds k = 1..N (32) ; nœud 0 = état mesuré
@@ -579,7 +582,7 @@ class RobustLanderSOCP(LanderSOCP):
         assert self.prob.is_dcp(dpp=True), "problem must be DPP"       # compilé une seule fois par CVXPY
 
     def solve(self, x0, tgo, m0=None, wind_const=0.0, xi0=0.0, gust_tau=1.0, walls=None, sigma=None,
-              allow_off=False, solver=cp.CLARABEL):
+              allow_off=False, solver=cp.CLARABEL, risk_walls=None):
         """Résout le SOCP robuste pour un temps de vol tgo. Même déroulé que LanderSOCP.solve : on donne une valeur
         à tous les paramètres, on résout, on empaquette la solution. Seuls changent les termes de dérive (Phase 1)
         et les paramètres des murs et du risque (Phase 3).
@@ -589,6 +592,8 @@ class RobustLanderSOCP(LanderSOCP):
         l'argument `shear` du constructeur) ; xi0 = rafale estimée maintenant ; gust_tau = temps de corrélation ;
         walls = (n, b) de forme (n_walls, N+1, 2) et (n_walls, N+1), ou None (aucun mur) ;
         sigma = écarts-types directionnels (n_walls, N+1), ou None pour désactiver le risque (ablation) ;
+        risk_walls = (n, b) de forme (n_risk, N+1, 2) et (n_risk, N+1) si le risque porte sur d'autres murs que
+        `walls` (None : les mêmes) ; sigma a alors la forme (n_risk, N+1) ;
         allow_off = basse gravité, où le moteur peut s'éteindre. Retourne une RobustSolution, ou None si échec."""
         N = self.N
         m0 = self.p.m_wet if m0 is None else m0
@@ -613,10 +618,12 @@ class RobustLanderSOCP(LanderSOCP):
         n, b = walls
         for j in range(self.n_walls):
             self.H[j].value, self.b[j].value = n[j], b[j]            # mur physique avec slack (paramètres hérités)
+        rn, rb = walls if risk_walls is None else risk_walls
+        for j in range(self.n_risk):
             if sigma is None:                        # risque désactivé (ablation) : marge énorme -> q = 0 à l'optimum
                 self.Hs[j].value, self.bs[j].value = np.zeros((N + 1, 2)), np.full(N + 1, OFF_B)
             else:                                    # n / sigma et b / sigma (voir le constructeur, règle DPP)
-                self.Hs[j].value, self.bs[j].value = n[j] / sigma[j][:, None], b[j] / sigma[j]
+                self.Hs[j].value, self.bs[j].value = rn[j] / sigma[j][:, None], rb[j] / sigma[j]
         t0 = time.perf_counter()
         try:
             self.prob.solve(solver=solver)           # Clarabel, le solveur conique par défaut de CVXPY
