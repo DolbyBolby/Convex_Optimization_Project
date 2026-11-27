@@ -10,10 +10,12 @@ class GCSPolicy(WindRobustController):
     """Guidage GCS (régions convexes + chemins) avec la gestion du vent de wind_robust.py.
 
     Hérité de WindRobustController : estimation de la rafale, feedforward dans _track, _terminal et _fallback,
-    référence avec vent. Les drapeaux use_drift, use_ff et use_risk désactivent une composante."""
+    référence avec vent. Les drapeaux use_drift, use_ff et use_risk activent ou désactivent une composante.
+    Le coût de risque est désactivé par défaut : avec ces régions, il a fait baisser le score moyen (20 graines
+    d'entraînement : 66.4 sans, 64.5 avec w_haz = 5, 60.5 avec w_haz = 150)."""
 
-    def __init__(self, spec, **kw):
-        super().__init__(spec, **kw)
+    def __init__(self, spec, use_risk=False, w_haz=20.0, **kw):
+        super().__init__(spec, use_risk=use_risk, w_haz=w_haz, **kw)
         start = to_pad(spec, spec["start"][:2])
         gate = self.gate = np.array([0.0, self.y_gate])
         carte = load_map(spec)
